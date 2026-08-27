@@ -91,26 +91,32 @@ static void update_authorized_pcc_rule_and_qos(
         OpenAPI_flow_information_t *FlowInformation = NULL;
         OpenAPI_qos_data_t *QosData = NULL;
         char *QosId = NULL;
-        int i;
 
-        for (i = 0; i < sess->policy.num_of_pcc_rule; i++)
-            OGS_PCC_RULE_FREE(&sess->policy.pcc_rule[i]);
-        sess->policy.num_of_pcc_rule = 0;
-
+        /*
+         * Issue #4526
+         *
+         * Per TS29.512 V18.13.0 4.2.6.1, quoted above, the "pccRules"
+         * map of an UpdateNotify is a delta: an entry with a value
+         * installs or modifies a rule, an entry with NULL removes it,
+         * and a rule absent from the map stays authorized. Only the
+         * Create operation carries a full description.
+         * sess->policy.pcc_rule[] is therefore merged, not rebuilt.
+         *
+         * Rebuilding dropped still-authorized rules, so the QoS flows
+         * bound to them were never matched again and leaked in
+         * sess->bearer_list until QosFlow Overflow. TS23.503 V18.11.0
+         * 6.1.3.2.4 requires the SMF to delete the QoS Flow when the
+         * last PCC rule bound to it is removed.
+         */
         OpenAPI_list_for_each(SmPolicyDecision->pcc_rules, node) {
+            ogs_pcc_rule_t new_pcc_rule;
             ogs_pcc_rule_t *pcc_rule = NULL;
+            ogs_pcc_rule_t *existing = NULL;
 
-            if (sess->policy.num_of_pcc_rule >= OGS_MAX_NUM_OF_PCC_RULE) {
-                ogs_error("Too many PccRules [%d:%d]",
-                        sess->policy.num_of_pcc_rule + 1,
-                        OGS_MAX_NUM_OF_PCC_RULE);
-                break;
-            }
+            memset(&new_pcc_rule, 0, sizeof(new_pcc_rule));
+            pcc_rule = &new_pcc_rule;
 
             QosData = NULL;
-            pcc_rule =
-                &sess->policy.pcc_rule[sess->policy.num_of_pcc_rule];
-            ogs_assert(pcc_rule);
 
             PccRuleMap = node->data;
             if (!PccRuleMap) {
@@ -125,11 +131,32 @@ static void update_authorized_pcc_rule_and_qos(
 
             PccRule = PccRuleMap->value;
             if (!PccRule) {
-                pcc_rule->type = OGS_PCC_RULE_TYPE_REMOVE;
-                pcc_rule->id = ogs_strdup(PccRuleMap->key);
-                ogs_assert(pcc_rule->id);
+                /*
+                 * NULL value removes the rule. Mark the authorized
+                 * entry as REMOVE so that the binding deletes the QoS
+                 * flow. If the id is unknown, append the REMOVE anyway:
+                 * a matching QoS flow may still be in sess->bearer_list
+                 * from before the table lost the rule.
+                 */
+                existing = smf_pcc_rule_find_by_id(sess, PccRuleMap->key);
+                if (existing) {
+                    OGS_PCC_RULE_FREE(existing);
+                } else if (sess->policy.num_of_pcc_rule <
+                            OGS_MAX_NUM_OF_PCC_RULE) {
+                    existing = &sess->policy.pcc_rule[
+                        sess->policy.num_of_pcc_rule];
+                    memset(existing, 0, sizeof(*existing));
+                    sess->policy.num_of_pcc_rule++;
+                } else {
+                    ogs_error("Too many PccRules [%d:%d]",
+                            sess->policy.num_of_pcc_rule + 1,
+                            OGS_MAX_NUM_OF_PCC_RULE);
+                    continue;
+                }
 
-                sess->policy.num_of_pcc_rule++;
+                existing->type = OGS_PCC_RULE_TYPE_REMOVE;
+                existing->id = ogs_strdup(PccRuleMap->key);
+                ogs_assert(existing->id);
                 continue;
             }
 
@@ -312,7 +339,22 @@ static void update_authorized_pcc_rule_and_qos(
                     pcc_rule->qos.gbr.uplink = OGS_MAX_BITRATE_NGAP;
             }
 
-            sess->policy.num_of_pcc_rule++;
+            /* Replace the entry with the same id, or append a new one */
+            existing = smf_pcc_rule_find_by_id(sess, new_pcc_rule.id);
+            if (existing) {
+                OGS_PCC_RULE_FREE(existing);
+                memcpy(existing, &new_pcc_rule, sizeof(new_pcc_rule));
+            } else if (sess->policy.num_of_pcc_rule <
+                        OGS_MAX_NUM_OF_PCC_RULE) {
+                memcpy(&sess->policy.pcc_rule[sess->policy.num_of_pcc_rule],
+                        &new_pcc_rule, sizeof(new_pcc_rule));
+                sess->policy.num_of_pcc_rule++;
+            } else {
+                ogs_error("Too many PccRules [%d:%d]",
+                        sess->policy.num_of_pcc_rule + 1,
+                        OGS_MAX_NUM_OF_PCC_RULE);
+                OGS_PCC_RULE_FREE(&new_pcc_rule);
+            }
         }
     }
 }
